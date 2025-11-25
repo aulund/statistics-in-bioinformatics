@@ -151,4 +151,9 @@ rownames(sumdf_order_p[sumdf_order_p$pvals_BH <= 0.05,])
 #[6] "LAS1L"   "DPM1"    "CYP51A1" "LAP3"    "ENPP4"  
 #[11] "FUCA2"   "SEMA3F"  "SCYL3"  
 
+plot(tdf$NFYA, tdf$ANKIB1, xlab="counts of NFYA", ylab="counts of ANKIB1", col=Group)
+legend("topleft", legend=levels(Group), pch=1, col=1:2)
 
+cor.test(tdf$LAS1L,tdf$DPM1, method = "pearson")
+
+cor(tdf, method = "spearman")

@@ -1,0 +1,396 @@
+---
+title: "Day 2"
+author: "Benjamin Ulfenborg, PhD"
+output:
+  prettydoc::html_pretty:
+    toc: TRUE
+vignette: >
+  %\VignetteIndexEntry{Day 2}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE}
+#Load libraries
+library(dplyr)
+library(DESeq2)
+library(pheatmap)
+library(ggplot2)
+library(ggrepel)
+library(RColorBrewer)
+library(limma)
+library(edgeR)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+# library(devtools)
+# devtools::install_gitlab(repo = "wolftower/biostudies")
+library(BioStudies)
+library(enrichR)
+library(gridExtra)
+library(stringr)
+
+#Download data
+if(!dir.exists("data")) dir.create("data")
+files <- getBio(accession = "E-MTAB-2523", path = "data")
+list.files("data")
+
+#Import data
+countTable.1 <- read.table("data/EGAD00001000831_Total_Exon_Reads_The_paired_FF-FFPE_colon_set.txt",
+                         as.is = TRUE, header = TRUE, sep = "\t", row.names = 1)
+sampleTable <- read.table("data/E-MTAB-2523.sdrf.txt",
+                          as.is = TRUE, header = TRUE, sep = "\t")
+
+#Inspect dataset
+dim(countTable.1)
+table(sampleTable$Characteristics.organism.part.)
+table(sampleTable$Characteristics.individual.)
+table(sampleTable$Characteristics.sex.)
+table(sampleTable$Characteristics.disease.)
+
+#Prepare sample annotation
+sampleTable <- sampleTable %>%
+  filter(
+    Characteristics.organism.part. == "colon",
+    grepl("FF$", Comment.ENA_ALIAS.),
+    !duplicated(Comment.ENA_ALIAS.)) %>%
+  transmute(
+    sample = Comment.ENA_ALIAS.,
+    individual = factor(Characteristics.individual.),
+    sex = factor(Characteristics.sex.),
+    disease = factor(recode(Characteristics.disease., `colon carcinoma` = "carcinoma")))
+knitr::kable(sampleTable)
+
+#Synchonize count data with sample table
+countTable.2 <- countTable.1[, -grep("FFPE", colnames(countTable.1))]
+countTable.3 <- countTable.2[, pmatch(sampleTable$sample, colnames(countTable.2))]
+colnames(countTable.3) <- sampleTable$sample
+countTable.3[1:5, 1:5]
+```
+
+
+```{r, message=FALSE}
+#Filter 0 counts
+meanLog2CPM <- rowMeans(log2(edgeR::cpm(countTable.3) + 1))
+#pdf("log2 CPM.pdf", height = 5, width = 10)
+hist(meanLog2CPM)
+```
+
+
+```{r, message=FALSE}
+#dev.off()
+sum(meanLog2CPM <= 1)
+countTable.4 <- countTable.3[meanLog2CPM > 1, ]
+dim(countTable.4)
+```
+
+
+```{r, message=FALSE}
+#Prepare data for QC
+dds <- DESeqDataSetFromMatrix(as.matrix(countTable.4),
+                              design = ~ 0 + disease + individual,
+                              colData = sampleTable)
+print(dds)
+modmat <- model.matrix(~ 0 + disease + individual + sex, data = sampleTable)[1:5, 1:5]
+rownames(modmat) <- sampleTable$sample[1:5]
+knitr::kable(modmat)
+```
+
+
+```{r, message=FALSE}
+#Normalize
+normCounts <- vst(dds, blind = TRUE)
+assay(normCounts)[1:5, 1:5]
+```
+
+
+```{r, message=FALSE}
+#Quality control
+
+#Distribution
+#pdf("Norm count dist.pdf", height = 5, width = 10)
+hist(assay(normCounts), main = "E-MTAB-2523")
+#dev.off()
+N <- 10
+rho <- 0.5
+#pdf("NB.pdf", height = 5, width = 10)
+hist(rnbinom(1e+05, size = N, prob = rho), main = "Negative binomial",
+     xlab = "")
+#dev.off()
+```
+
+
+```{r, message=FALSE}
+#Sample heatmap
+sampleDist <- cor(assay(normCounts), method = "spearman")
+while(!is.null(dev.list())) dev.off()
+#pdf("Heatmap.pdf", onefile = FALSE, height = 5, width = 10)
+sampleColor <- brewer.pal(3, "Accent")[1:2]
+names(sampleColor) <- levels(sampleTable$disease)
+pheatmap(sampleDist,
+         clustering_distance_rows = as.dist(1 - sampleDist),
+         clustering_distance_cols = as.dist(1 - sampleDist),
+         annotation_col = data.frame(Disease = sampleTable$disease,
+                                     row.names = sampleTable$sample),
+         annotation_colors = list(Disease = sampleColor))
+while(!is.null(dev.list())) dev.off()
+```
+
+
+```{r, message=FALSE}
+#Sample PCA
+pcaRes <- prcomp(t(assay(normCounts)))
+varExp <- round(pcaRes$sdev^2 / sum(pcaRes$sdev^2) * 100)
+pcaDF <- data.frame(
+  PC1 = pcaRes$x[, 1],
+  PC2 = pcaRes$x[, 2],
+  Disease = sampleTable$disease,
+  Sample = sampleTable$sample
+)
+pcaPlot <- ggplot(
+    data = pcaDF,
+    mapping = aes(x = PC1, y = PC2, color = Disease, label = Sample)) +
+  geom_point(size = 3) +
+  geom_text_repel(size = 4) +
+  labs(x = paste0("PC1 (", varExp[1], " %)"),
+       y = paste0("PC2 (", varExp[2], " %)")) +
+  theme_minimal() +
+  theme(axis.text = element_text(size = 12),
+        legend.text = element_text(size = 10)) +
+  scale_color_manual(values = sampleColor)
+plot(pcaPlot)
+#ggsave(plot = pcaPlot, filename = "PCA.pdf", height = 5, width = 10)
+```
+
+
+```{r, message=FALSE}
+#Remove outlier
+countTable.5 <- subset(countTable.4, select = -C6_T_FF)
+sampleTable <- subset(sampleTable, subset = sample != "C6_T_FF")
+sampleTable <- droplevels(sampleTable)
+colnames(countTable.5)
+```
+
+```{r, message=FALSE}
+#Step 1: define design matrix
+designMatrix <- model.matrix(~ 0 + disease + individual, data = sampleTable)
+designMatrix[1:5, 1:5]
+```
+
+
+```{r, message=FALSE}
+#Step 2: define contrast matrix
+contrastMatrix <- makeContrasts(CarcinomaVsNormal = diseasecarcinoma - diseasenormal,
+                                levels = designMatrix)
+head(contrastMatrix)
+```
+
+
+```{r, message=FALSE}
+#Step 3: Fit model
+dge <- DGEList(countTable.5)
+dge <- calcNormFactors(dge)
+dge <- estimateDisp(dge, designMatrix, robust = TRUE)
+fit <- glmQLFit(dge, designMatrix, robust = TRUE)
+```
+
+
+```{r, message=FALSE}
+#Step 4: Perform hypothesis testing
+res <- glmQLFTest(fit, contrast = contrastMatrix)
+res <- topTags(res, n = nrow(countTable.5))
+sigRes <- subset(res$table, FDR < 0.05 & abs(logFC) > 1)
+knitr::kable(head(sigRes))
+head(sigRes,11)
+```
+
+
+```{r, message=FALSE}
+#Visualize results
+volcanoPlot <- ggplot(res$table,
+    aes(x = logFC, y = -log10(FDR),
+        color = ifelse(FDR < 0.05 & abs(logFC) > 1, "darkred", "grey"))) +
+  geom_point() +
+  xlab(expression("Fold Change, Log"[2]*"")) +
+  ylab(expression("Adjusted P value, Log"[10]*"")) +
+  geom_vline(
+    xintercept = c(-1, 1), linetype = "dotted", linewidth = 1) +
+  geom_hline(
+    yintercept = -log10(0.05), linetype = "dotted", linewidth = 1) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  scale_colour_manual(values = c("darkred", "grey", "steelblue")) +
+  geom_text_repel(aes(x = logFC, y = -log10(FDR),
+                      label = rownames(res$table)[1:10],
+                      size = 2, color = "steelblue"),
+                  data = res$table[1:10, ])
+print(volcanoPlot)
+#ggsave(plot = volcanoPlot, filename = "Volcano plot.pdf", width = 8, height = 5)
+```
+
+
+```{r, message=FALSE}
+#Enrichment analysis (ORA) --------------------------------------------
+
+#GO
+goORA <- enrichGO(
+  gene = rownames(sigRes),
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP", #BP, MF or CC
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05)
+
+#Convert symbols to Entrez IDs
+keytypes(org.Hs.eg.db)
+sigRes$Entrez = clusterProfiler::bitr(
+  rownames(sigRes),
+  fromType = "SYMBOL",
+  toType = c("ENTREZID"),
+  OrgDb = org.Hs.eg.db,
+  drop = FALSE)$ENTREZID
+
+#KEGG
+keggORA <- enrichKEGG(
+  gene = sigRes$Entrez,
+  organism = "hsa",
+  keyType = "ncbi-geneid",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05)
+
+#Enrichment analysis (GSEA) ----------------------------------
+allFC <- sort(res$table$logFC, decreasing = TRUE)
+names(allFC) <- rownames(res$table)
+goGSEA <- gseGO(
+  geneList = allFC,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  minGSSize = 10,
+  maxGSSize = 500,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05)
+
+df <- bitr(
+  rownames(res$table),
+  fromType = "SYMBOL",
+  toType = c("ENTREZID"),
+  OrgDb = org.Hs.eg.db,
+  drop = FALSE)
+df <- df[-which(duplicated(df$SYMBOL)), ]
+res$table$Entrez <- df$ENTREZID
+
+## KEGG GSEA
+allFC <- res$table$logFC
+names(allFC) <- res$table$Entrez
+# remove genes with NA Entrez IDs
+allFC <- allFC[!is.na(names(allFC))]
+# remove duplicated Entrez IDs
+allFC <- allFC[!duplicated(names(allFC))]
+# sort after cleaning
+allFC <- sort(allFC, decreasing = TRUE)
+keggGSEA <- gseKEGG(
+  geneList      = allFC,
+  organism      = "hsa",
+  keyType       = "ncbi-geneid",
+  pvalueCutoff  = 0.05
+)
+```
+
+
+```{r, message=FALSE}
+# Visualization --------------------------------------------
+#pdf("cnetplot.pdf", width = 10, height = 8)
+cnetplot(goORA, colorEdge = TRUE, cex_label_gene = 0.5)
+#dev.off()
+#pdf("dotplot.pdf", width = 10, height = 8)
+dotplot(goORA)
+#dev.off()
+goSEA <- pairwise_termsim(goORA)
+#pdf("treeplot.pdf", width = 14, height = 8)
+treeplot(goSEA)
+#dev.off()
+```
+
+
+```{r, message=FALSE}
+## GO GSEA
+cnetplot(goGSEA)
+```
+
+
+```{r, message=FALSE}
+dotplot(goGSEA)
+```
+
+
+```{r, message=FALSE}
+goGSEA <- pairwise_termsim(goGSEA)
+treeplot(goGSEA)
+```
+
+
+```{r, message=FALSE}
+## KEGG GSEA
+cnetplot(keggGSEA)
+```
+
+
+```{r, message=FALSE}
+dotplot(keggGSEA)
+```
+
+
+```{r, message=FALSE}
+keggGSEA <- pairwise_termsim(keggGSEA)
+treeplot(keggGSEA)
+```
+
+
+```{r, message=FALSE}
+#Enrichment analysis with EnrichR --------------------------------------
+enrichmentRes <- enrichr(
+  genes = rownames(sigRes),
+  databases = c("GO_Biological_Process_2025",
+                "KEGG_2019_Human"))
+enrichmentRes$GO_Biological_Process_2025[1:5, 1:4]
+enrichmentRes$KEGG_2019_Human[1:5, 1:4]
+
+#Visualize significant terms
+enrichPlots <- list()
+for(res in names(enrichmentRes)){
+  plotDF <- enrichmentRes[[res]][1:10, ]
+  plotDF$Term = str_trunc(plotDF$Term, 45)
+  plotDF$Term <- factor(plotDF$Term, levels = rev(plotDF$Term))
+  enrichPlot <- ggplot(plotDF, aes(x = Term, y = -log10(Adjusted.P.value))) +
+    geom_bar(stat = "identity", width = 0.05) +
+    geom_point(size = 3) +
+    theme_minimal() +
+    theme(
+      text = element_text(size = 10),
+      plot.title = element_text(hjust = (10 / nchar(res)) * 2),
+      plot.margin = margin(t = 5, r = 50, b = 5, unit = "pt"),
+      axis.text.y = element_text(size = 8)) +
+    coord_flip() +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+               color = "gray") +
+    labs(title = res, y = expression("Adjusted P value, Log"[10]*""))
+  enrichPlots[[res]] <- enrichPlot
+}
+```
+
+
+```{r, message=FALSE}
+plot(enrichPlots[[1]])
+plot(enrichPlots[[2]])
+
+ggsave("Enrichment_plots.pdf", arrangeGrob(grobs = enrichPlots,
+                                          layout_matrix = rbind(c(1, 2))))
+
+
+```
