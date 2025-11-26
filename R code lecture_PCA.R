@@ -2,7 +2,7 @@
 A=matrix(c(67,77,89,170,173,179,120,123,130),3,3)
 A
 A[3,2]
-A[3,1:3] # Print all values in row 3
+A[3,1:2] # Print all values in row 3
 A[3,] # Print all values in row 3 
 
 
@@ -88,7 +88,7 @@ summary(pca)
 list.files()
 
 # Read in the bulk RNAseq data in R
-Bulk_RNAseq_counts <- read.csv("/Users/aulund/Documents/GitHub/statistics in bioinf/CVID_bioinfo.csv", header=TRUE, sep=";", row.names = 1)
+Bulk_RNAseq_counts <- read.csv("CVID_bioinfo.csv", header=TRUE, sep=";", row.names = 1)
 head(Bulk_RNAseq_counts)
 
 Group=factor(rep(c("CVID","HD"),c(9,9))) # Define groups
@@ -125,7 +125,7 @@ ggplot(PCA, aes(x = PC1, y = PC2, color = Group)) +
 # We will now try PCA on scRNAseq data
 # 1. Read in the sc data
 rm(list=ls())
-scRNAseq_counts = read.csv("/Users/aulund/Documents/GitHub/statistics in bioinf/scRNAseq_data.csv", row.names = 1, check.names = FALSE)
+scRNAseq_counts = read.csv("scRNAseq_data.csv", row.names = 1, check.names = FALSE)
 dim(scRNAseq_counts)
 scRNAseq_counts[1:12,1:3]
 
@@ -213,7 +213,7 @@ ggplot(UM, aes(x = Dim1, y = Dim2, color = cluster)) +
 
 # Identify cells (annotate cells)
 # Choose a gene: CD3D = T cells, MS4A1 = B cells, CD14 = Monocytes, , KLRD1 = NK-cells
-gene = "MS4A1"
+gene = "KLRD1"
 expr = as.numeric(log_norm_counts[gene, ])
 cols = colorRampPalette(c("lightgrey", "blue"))(100)[cut(expr, breaks = 100)]
 plot(umap_res$layout,pch=16,cex=0.5,col=cols,main="UMAP")
@@ -222,7 +222,7 @@ plot(umap_res$layout,pch=16,cex=0.5,col=cols,main="UMAP")
 
 # Drug data in R
 rm(list=ls())
-df=read.csv("/Users/aulund/Documents/GitHub/statistics in bioinf/Cytokines.csv",header=TRUE,sep=";",dec=",")
+df=read.csv("Cytokines.csv",header=TRUE,sep=";",dec=",")
 df[1:4,1:4]
 
 # Extract only dugs (not the controls) and log the data
@@ -258,3 +258,4 @@ PCA = pca$x[, c(1,3)]
 plot(PCA,pch=16,cex=2,main="PCA",col="lightblue")
 text(PCA[,1],PCA[,2],rownames(PCA),cex=0.6)
 
+# End of code

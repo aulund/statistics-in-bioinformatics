@@ -1,0 +1,151 @@
+---
+title: "Day 3 lecture code"
+author: "Benjamin Ulfenborg & Dirk Repsilber"
+output:
+  prettydoc::html_pretty:
+    toc: TRUE
+vignette: >
+  %\VignetteIndexEntry{Day 3}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE}
+#Load libraries
+library(dplyr)
+library(DESeq2)
+library(pheatmap)
+library(ggplot2)
+library(ggrepel)
+library(RColorBrewer)
+library(limma)
+library(edgeR)
+library(C50)
+
+load("Day2_BenjaminDirk_results.Rdata")
+```
+
+# Decision tree signature
+
+## prepare outcome
+
+```{r}
+sample_info <- as.data.frame(colData(dds))
+stopifnot("disease" %in% colnames(sample_info))
+
+y <- factor(sample_info$disease)
+stopifnot(!is.null(rownames(sample_info)))  # rownames = sample IDs
+```
+
+
+## predictors: VST-normalised expression
+
+```{r}
+normCounts <- vst(dds, blind = FALSE)
+
+expr <- assay(normCounts)                  # genes x samples
+expr <- expr[, rownames(sample_info), drop = FALSE]  # align to colData
+
+trainingSet <- t(expr)                     # samples x genes
+trainingSet <- as.data.frame(trainingSet)
+
+stopifnot(identical(rownames(trainingSet), rownames(sample_info)))
+stopifnot(nrow(trainingSet) == length(y))
+```
+
+
+## feature selection: mean log2 CPM per gene
+
+```{r}
+
+count_matrix <- assay(dds)                         # genes x samples
+count_matrix <- count_matrix[, rownames(sample_info), drop = FALSE]
+
+cpm_mat <- cpm(count_matrix)
+meanLog2CPM <- rowMeans(log2(cpm_mat + 1))
+names(meanLog2CPM) <- rownames(count_matrix)       # gene IDs
+
+select_features <- function(x_train, meanLog2CPM, top_quantile = 0.9,
+                            min_mean_log2cpm = 1) {
+  # x_train: training data (samples x genes)
+  mu  <- apply(x_train, 2, mean, na.rm = TRUE)
+  sig <- apply(x_train, 2, sd,   na.rm = TRUE)
+  score <- sig / pmax(mu, .Machine$double.eps)     # sd/mean
+  
+  # align CPM info
+  current_genes <- names(score)
+  meanLog2CPM_sel <- meanLog2CPM[current_genes]
+  meanLog2CPM_sel[is.na(meanLog2CPM_sel)] <- -Inf  # drop genes missing CPM
+  
+  high_score <- score > stats::quantile(score, top_quantile, na.rm = TRUE)
+  expressed  <- meanLog2CPM_sel > min_mean_log2cpm
+  
+  selected <- current_genes[high_score & expressed]
+  selected
+}
+```
+
+
+## LOOCV with C5.0 + feature selection
+
+```{r}
+n <- nrow(trainingSet)
+fold_ids <- seq_len(n)
+
+predicted <- factor(rep(NA, n), levels = levels(y))
+selected_genes_per_fold <- vector("list", n)
+
+set.seed(1)
+
+for (i in fold_ids) {
+  cat("Fold", i, "of", n, "\n")
+  
+  train_idx <- setdiff(fold_ids, i)
+  test_idx  <- i
+  
+  x_train <- trainingSet[train_idx, , drop = FALSE]
+  y_train <- y[train_idx]
+  
+  # feature selection on training set only
+  sel_genes <- select_features(x_train, meanLog2CPM,
+                               top_quantile = 0.9,
+                               min_mean_log2cpm = 1)
+  
+  # if selection is too strict and returns nothing, relax it
+  if (length(sel_genes) == 0) {
+    warning("No genes selected in fold ", i, 
+            ". Using all genes for this fold.")
+    sel_genes <- colnames(trainingSet)
+  }
+  
+  selected_genes_per_fold[[i]] <- sel_genes
+  
+  x_train_sel <- x_train[, sel_genes, drop = FALSE]
+  x_test_sel  <- trainingSet[test_idx, sel_genes, drop = FALSE]
+  
+  # fit C5.0 model
+  fit <- C50::C5.0(x = x_train_sel, y = y_train)
+  
+  # predict left-out sample
+  predicted[i] <- predict(fit, newdata = x_test_sel)
+}
+```
+
+
+## performance evaluation
+
+```{r}
+observed <- y
+conf_mat <- table(Observed = observed, Predicted = predicted)
+conf_mat
+
+accuracy <- mean(predicted == observed)
+accuracy
+
+confusionMatrix(predicted, observed)
+
+```

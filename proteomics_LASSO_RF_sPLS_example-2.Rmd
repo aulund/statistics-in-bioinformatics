@@ -1,0 +1,817 @@
+---
+title: "MEDBIOINFO: Statistics for Bioinformatics -- proteomics LASSO, RF, and sPLS examples"
+author: "Dirk.Repsilber@oru.se"
+date: '2025-11-26'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+# Setup: load R packages
+
+```{r,cache=TRUE}
+library(openxlsx)
+library(pROC)
+library(ncvreg)
+library(caret)
+library(qvalue)
+library(ranger)
+```
+
+
+# Read and format clinical and OLINK proteomics data
+
+```{r,cache=TRUE}
+proteins.X    <- readRDS(file = "proteomicsData.RDS") # protein data on log2-level
+clinical.data <- readRDS(file = "clinicalData.RDS")
+dim(proteins.X)
+dim(clinical.data)
+```
+
+
+# Univariate analyses
+
+We compare group "0" (cardiovascular event) to group "3" (control), for example.
+
+```{r,cache=TRUE}
+
+results.uni <- list()
+
+
+  
+results.uni$name <- "ttest-0-vs-3"
+
+# reference:
+index.ref  <- which(clinical.data$group == 3)
+
+# to be compared to:
+index.comp <- which(clinical.data$group == 0)
+  
+p <- c()
+delta <- c()
+  
+for(i in 1:ncol(proteins.X)){
+  p[i]     <- (t.test(proteins.X[index.comp,i], proteins.X[index.ref,i]))$p.value
+  delta[i] <- (t.test(proteins.X[index.comp,i], proteins.X[index.ref,i]))$estimate[1] - (t.test(proteins.X[index.comp,i], proteins.X[index.ref,i]))$estimate[2]
+}
+
+hist(p) # judge if distribution of p- values is eligible for qvalue-FDR estimation
+  
+q <- qvalue(p)$q
+  
+results.uni$protein <- colnames(proteins.X)[order(p,decreasing=FALSE)]
+results.uni$p       <- p[order(p,decreasing=FALSE)]
+results.uni$q       <- q[order(p,decreasing=FALSE)]
+results.uni$delta   <- delta[order(p,decreasing=FALSE)]
+
+# volcano plot:
+plot(results.uni$delta,-log10(results.uni$q))
+abline(h=1,col="red")
+abline(v=-1,col="blue")
+abline(v=1,col="blue")
+# -> 7 proteins with FDR < 0.01 and abs(delta) > 1 (two-fold)
+colnames(proteins.X)[ which( abs(results.uni$delta)>1 & results.uni$q < 0.01 ) ]
+
+# save results as xlsx:
+wb <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb=wb, sheetName=results.uni$name)
+
+openxlsx::writeDataTable(wb=wb,sheet=results.uni$name,
+                         x=data.frame(protein=results.uni$protein,
+                                      p=results.uni$p,
+                                      q=results.uni$q,
+                                      delta=results.uni$delta))
+
+openxlsx::saveWorkbook(wb=wb,file="UnivariateResults_group0_vs_reference3.xlsx",overwrite=TRUE)
+
+```
+
+
+# LASSO
+
+## step 0: preparations for ML analysis
+
+```{r,cache=TRUE}
+results.LASSO <- list()
+
+proteins.X.scaled <- scale(proteins.X,center = TRUE, scale=TRUE)
+
+# Here, choose if to use scaled or un-scaled proteins:
+#proteins.X.to.be.used <- proteins.X
+proteins.X.to.be.used <- proteins.X.scaled
+
+results.LASSO$name <- "pred-0-vs-3"
+  
+## prepare dataset and outcome}
+proteins.0.3 <- proteins.X.to.be.used[clinical.data$group %in% c(0,3),]
+CC.0.3       <- clinical.data$group[clinical.data$group %in% c(0,3)]
+CC <- ifelse(CC.0.3==3,0,1) # as "3" is the actual reference, we code it as "0"
+proteins <- proteins.0.3
+```
+
+## step 1: model fit and variable selection
+
+The function "cv.ncvreg" already performs a 10-fold cross-validation for optimising the hyper-parameters of LASSO, so no need to program this yourself (this is different for the Random Forest example, see below).
+
+```{r,cache=TRUE}
+print(paste("fitting model",0,"vs reference..."))
+  
+reg.res <- cv.ncvreg(X=as.data.frame(proteins),y=CC,family="binomial",max.iter=100000,dfmax=50,penalty="lasso")
+eta <- predict(reg.res,proteins)
+yvh <- 1 / (1 + exp(-eta))
+my.h <- hist(yvh)
+pred <- ifelse(yvh > 0.5,"case","control")
+my.tab <- table(data.frame(CC,pred))
+print(my.tab) # fitting is successful?
+results.LASSO$fit.tab <- my.tab
+results.LASSO$fit.yhat <- yvh
+results.LASSO$hist.yhat <- my.h
+
+print(paste("repeated fitting and variable selection..."))
+  
+my.coefs <- matrix(0,ncol=100,nrow=ncol(proteins)+1)
+n.repeated <- 10
+set.seed(123)
+for(i in 1:n.repeated){
+  reg.res <- cv.ncvreg(X=as.data.frame(proteins),y=CC,family="binomial",max.iter=100000,dfmax=50,penalty="lasso")
+  my.coefs[which(coef(reg.res)!=0),i] <- coef(reg.res)[which(coef(reg.res)!=0)]
+  cat(".",append=TRUE)
+}
+imp <- (apply(my.coefs,1,function(x){sum(abs(x))}))[-1] # without importance of intercept
+barplot(imp)
+sum(imp!=0) # gives number of selected proteins
+selected.proteins <- which(imp>0)
+print(colnames(proteins)[selected.proteins])
+
+results.LASSO$index.selected.proteins <- selected.proteins
+results.LASSO$names.selected.proteins <- colnames(proteins)[selected.proteins]
+results.LASSO$coefs.selected.proteins <- imp
+```
+
+## step 2: evaluating performance (nested CV)
+
+```{r,cache=TRUE}
+print(paste("evaluating performance..."))
+### performance: CV
+set.seed(1)
+ncv <- 100
+cutoff <- 0.5
+cv.sens <- cv.spec <- cv.ppv <- cv.npv <- cv.auc <- c()
+TP <- TN <- FP <- FN <- c()
+
+for(cv in 1:ncv){ # outer CV loop
+  if(cv%%10==0) print(cv)
+  cv.index <- createDataPartition(y=as.factor(CC),p=0.1,list=FALSE) # 100 outer CVs with 10% test sets, stratified regarding groups!
+  x.train <- proteins[-cv.index,]
+  y.train <- CC[-cv.index]
+  x.test  <- proteins[cv.index,]
+  y.test  <- CC[cv.index]
+  fit <- cv.ncvreg(X=x.train,y=y.train,family="binomial",max.iter=100000,dfmax=50,penalty="lasso")
+  eta <- predict(fit,x.test)
+  yvh <- 1 / (1 + exp(-eta))
+  pred <- ifelse(yvh > cutoff,"1","0")
+  test.res <- cbind(c(sum(y.test==1 & pred==1),sum(y.test==0 & pred==1)),
+                      c(sum(y.test==1 & pred==0),sum(y.test==0 & pred==0)))
+  TP[cv]=test.res[1,1]; TN[cv]=test.res[2,2]; FP[cv]=test.res[2,1]; FN[cv]=test.res[1,2]
+  cv.sens[cv] <- TP[cv]/(TP[cv]+FN[cv])
+  cv.spec[cv] <- TN[cv]/(TN[cv]+FP[cv])
+  cv.ppv[cv]  <- TP[cv]/(TP[cv]+FP[cv])
+  cv.npv[cv]  <- TN[cv]/(TN[cv]+FN[cv])
+  cv.auc[cv]  <-  as.numeric(pROC::auc(response=y.test, predictor=yvh, quiet=TRUE))
+}
+
+# figures for performance results:
+par(mfrow=c(2,2))
+hist(cv.sens,main=paste("sens",paste(round(quantile(cv.sens,probs=c(0.025,0.5,0.975)),digits=4),collapse=" ")))
+hist(cv.spec,main=paste("spec",paste(round(quantile(cv.spec,probs=c(0.025,0.5,0.975)),digits=4),collapse=" ")))
+hist(cv.ppv, main=paste("ppv", paste(round(quantile(cv.ppv,probs=c(0.025,0.5,0.975)), digits=4),collapse=" ")))
+hist(cv.npv, main=paste("npv", paste(round(quantile(cv.npv,probs=c(0.025,0.5,0.975)), digits=4),collapse=" ")))
+par(mfrow=c(1,1))
+
+# mean confusion matrix:
+tab <- cbind(c(mean(TP),mean(FP)),c(mean(FN),mean(TN)))
+rownames(tab) <- c("1","0")
+colnames(tab) <- c("pred 1","pred 0")
+print(tab)
+
+
+results.LASSO$TP <- TP
+results.LASSO$TN <- TN
+results.LASSO$FP <- FP
+results.LASSO$FN <- FN
+results.LASSO$cv.sens <- cv.sens
+results.LASSO$cv.spec <- cv.spec
+results.LASSO$cv.ppv <- cv.ppv
+results.LASSO$cv.npv <- cv.npv
+results.LASSO$cv.auc <- cv.auc
+```
+
+## step 3: establishing significance of original performance (nested CV)
+
+```{r,cache=TRUE}
+### permuted labels performance (CV)
+print(paste("permutation tests..."))
+set.seed(1)
+ncv <- 100
+cutoff <- 0.5
+cv.sens.perm <- cv.spec.perm <- cv.ppv.perm <- cv.npv.perm <- cv.auc.perm <- c()
+TP.perm <- TN.perm <- FP.perm <- FN.perm <- c()
+
+for(cv in 1:ncv){   # outer CV loop 
+  CC.perm <- sample(CC)
+  if(cv%%10==0) print(cv)
+  cv.index <- createDataPartition(y=as.factor(CC.perm),p=0.1,list=FALSE) 
+  x.train <- proteins[-cv.index,]
+  y.train <- CC.perm[-cv.index]
+  x.test  <- proteins[cv.index,]
+  y.test  <- CC.perm[cv.index]
+  fit <- cv.ncvreg(X=x.train,y=y.train,family="binomial",max.iter=100000,dfmax=50,penalty="lasso")
+  eta <- predict(fit,x.test)
+  yvh <- 1 / (1 + exp(-eta))
+  pred <- ifelse(yvh > cutoff,"1","0")
+  test.res <- cbind(c(sum(y.test==1 & pred==1),sum(y.test==0 & pred==1)),
+                      c(sum(y.test==1 & pred==0),sum(y.test==0 & pred==0)))
+  TP.perm[cv]=test.res[1,1]; TN.perm[cv]=test.res[2,2]; FP.perm[cv]=test.res[2,1]; FN.perm[cv]=test.res[1,2]
+  cv.sens.perm[cv] <- TP.perm[cv]/(TP.perm[cv]+FN.perm[cv])
+  cv.spec.perm[cv] <- TN.perm[cv]/(TN.perm[cv]+FP.perm[cv])
+  cv.ppv.perm[cv]  <- TP.perm[cv]/(TP.perm[cv]+FP.perm[cv])
+  cv.npv.perm[cv]  <- TN.perm[cv]/(TN.perm[cv]+FN.perm[cv])
+  cv.auc.perm[cv]  <- as.numeric(pROC::auc(response=y.test, predictor=yvh,quiet=TRUE))
+}
+
+# figures for performance results:
+par(mfrow=c(2,2))
+hist(cv.sens.perm,main=paste("perm sens",paste(round(quantile(cv.sens.perm,probs=c(0.025,0.5,0.975),na.rm=TRUE),digits=2),collapse=" ")))
+hist(cv.spec.perm,main=paste("perm spec",paste(round(quantile(cv.spec.perm,probs=c(0.025,0.5,0.975),na.rm=TRUE),digits=2),collapse=" ")))
+hist(cv.ppv.perm,main=paste("perm ppv",paste(round(quantile(cv.ppv.perm,probs=c(0.025,0.5,0.975),na.rm=TRUE),digits=2),collapse=" ")))
+hist(cv.npv.perm,main=paste("perm npv",paste(round(quantile(cv.npv.perm,probs=c(0.025,0.5,0.975),na.rm=TRUE),digits=2),collapse=" ")))
+par(mfrow=c(1,1))
+```
+
+
+
+```{r}
+# mean confusion matrix (permutation test):
+tab <- cbind(c(mean(TP.perm),mean(FP.perm)),c(mean(FN.perm),mean(TN.perm)))
+rownames(tab) <- c("0","1")
+colnames(tab) <- c("pred 1","pred 0")
+print(tab)
+
+results.LASSO$TP.perm <- TP.perm
+results.LASSO$TN.perm <- TN.perm
+results.LASSO$FP.perm <- FP.perm
+results.LASSO$FN.perm <- FN.perm
+results.LASSO$cv.sens.perm <- cv.sens.perm
+results.LASSO$cv.spec.perm <- cv.spec.perm
+results.LASSO$cv.ppv.perm <- cv.ppv.perm
+results.LASSO$cv.npv.perm <- cv.npv.perm
+results.LASSO$cv.auc.perm <- cv.auc.perm
+  
+results.LASSO$p.val.perm.sens <- sum(cv.sens.perm >= mean(cv.sens),na.rm=TRUE) / length(cv.sens)
+results.LASSO$p.val.perm.sens
+
+results.LASSO$p.val.perm.spec <- sum(cv.spec.perm >= mean(cv.spec),na.rm=TRUE) / length(cv.spec)
+results.LASSO$p.val.perm.spec
+
+results.LASSO$p.val.perm.ppv  <- sum(cv.ppv.perm  >= mean(cv.ppv),na.rm=TRUE) / length(cv.ppv)
+results.LASSO$p.val.perm.ppv
+
+results.LASSO$p.val.perm.npv  <- sum(cv.npv.perm  >= mean(cv.npv),na.rm=TRUE) / length(cv.npv)
+results.LASSO$p.val.perm.npv
+
+results.LASSO$p.val.perm.auc  <- sum(cv.auc.perm  >= mean(cv.auc),na.rm=TRUE) / length(cv.auc)
+results.LASSO$p.val.perm.auc
+
+results.LASSO
+
+saveRDS(object=results.LASSO,file="allresults_predictions_LASSO.RDS")
+save.image("allResults02_20230929_lasso.Rdata")
+```
+
+
+
+
+# Random Forest
+
+## step 0: preparations for ML analysis
+
+(same as above for LASSO)
+
+```{r,cache=TRUE}
+results.RF <- list()
+
+proteins.X.scaled <- scale(proteins.X,center = TRUE, scale=TRUE)
+
+# Here, choose if to use scaled or un-scaled proteins:
+#proteins.X.to.be.used <- proteins.X
+proteins.X.to.be.used <- proteins.X.scaled
+
+results.RF$name <- "pred-0-vs-3"
+  
+## prepare dataset and outcome}
+proteins.0.3 <- proteins.X.to.be.used[clinical.data$group %in% c(0,3),]
+CC.0.3       <- clinical.data$group[clinical.data$group %in% c(0,3)]
+CC <- ifelse(CC.0.3==3,0,1) # as "3" is the actual reference, we code it as "0"
+proteins <- proteins.0.3
+```
+
+## step 1: model fit and variable selection
+
+We use function "ranger" as implementation of the Random Forest approach.
+
+```{r,cache=TRUE}
+print(paste("fitting RF model",0,"vs reference..."))
+
+tgrid <- expand.grid(
+  mtry = seq(from=5, to=200, by=40),
+  splitrule = "gini",
+  min.node.size = seq(from=2, to=32, by=5)
+)
+
+CCfact  <- as.factor(ifelse(CC==1,"B","A"))
+my.data <- data.frame(CCfact, proteins) 
+
+RF.fit <- train(CCfact  ~ ., data = my.data,
+                method = "ranger",
+                trControl = trainControl(method="cv", number = 5, verboseIter = FALSE, classProbs = FALSE),
+                tuneGrid = tgrid,
+                num.trees = 100,
+                importance = "permutation")
+
+RF.pred <- predict(RF.fit, proteins)
+
+## confusion matrix:
+table(CCfact,RF.pred)
+```
+
+
+```{r}
+print(paste("repeated fitting and variable selection..."))
+  
+RF.imp.mat <- matrix(0,ncol=100,nrow=ncol(proteins))
+n.repeated <- 5
+set.seed(123)
+for(i in 1:n.repeated){
+  RF.fit <- train(CCfact  ~ ., data = my.data,
+                method = "ranger",
+                trControl = trainControl(method="cv", number = 5, verboseIter = FALSE, classProbs = FALSE),
+                tuneGrid = tgrid,
+                num.trees = 100,
+                importance = "permutation")
+  RF.imp.mat[,i] <- (varImp(RF.fit))$importance$Overall
+  cat(".",append=TRUE)
+}
+RF.imp <- apply(RF.imp.mat,1,function(x){mean(x)})
+barplot(RF.imp)
+abline(h=sort(RF.imp,decreasing = TRUE)[31], col="red")
+RF.selected.proteins <- which(RF.imp > sort(RF.imp,decreasing = TRUE)[31])  # top 30 proteins
+print(colnames(proteins)[RF.selected.proteins])
+
+results.RF$index.selected.proteins <- RF.selected.proteins
+results.RF$names.selected.proteins <- colnames(proteins)[RF.selected.proteins]
+results.RF$importances <- RF.imp
+```
+
+## step 2: evaluating performance (nested CV)
+
+```{r,cache=TRUE}
+print(paste("evaluating performance for RF ..."))
+### performance: CV
+set.seed(1)
+ncv <- 10
+cv.sens <- cv.spec <- cv.ppv <- cv.npv <- cv.auc <- c()
+TP <- TN <- FP <- FN <- c()
+
+for(cv in 1:ncv){ # outer CV loop
+  cat(".",append=TRUE)
+  if(cv%%10==0) print(cv)
+  cv.index <- createDataPartition(y=as.factor(CC),p=0.1,list=FALSE) # 100 outer CVs with 10% test sets, stratified! as using y as factor
+  x.train <- proteins[-cv.index,]
+  y.train <- CC[-cv.index]
+  x.test  <- proteins[cv.index,]
+  y.test  <- ifelse(CC[cv.index]==1,"B","A")
+  
+  CCfact  <- as.factor(ifelse(y.train==1,"B","A"))
+  my.data <- data.frame(CCfact, x.train) 
+  RF.fit <- train(CCfact  ~ ., data = my.data,
+                  method = "ranger",
+                  trControl = trainControl(method="cv", number = 5, verboseIter = FALSE, classProbs = TRUE),
+                  tuneGrid = tgrid,
+                  num.trees = 100,
+                  importance = "permutation")
+
+  pred.prob <- (predict(RF.fit, x.test, type="prob"))$B  # probability of case ("B" or 1 or group=0, in our example)
+  pred <- predict(RF.fit, x.test)
+  
+  test.res <- cbind(c(sum(y.test=="B" & pred=="B"),sum(y.test=="A" & pred=="B")),
+                      c(sum(y.test=="B" & pred=="A"),sum(y.test=="A" & pred=="A")))
+  
+  TP[cv]=test.res[1,1]; TN[cv]=test.res[2,2]; FP[cv]=test.res[2,1]; FN[cv]=test.res[1,2]
+  
+  cv.sens[cv] <- TP[cv]/(TP[cv]+FN[cv])
+  cv.spec[cv] <- TN[cv]/(TN[cv]+FP[cv])
+  cv.ppv[cv]  <- TP[cv]/(TP[cv]+FP[cv])
+  cv.npv[cv]  <- TN[cv]/(TN[cv]+FN[cv])
+  cv.auc[cv]  <-  as.numeric(pROC::auc(response=y.test, predictor=pred.prob, quiet=TRUE))
+}
+
+# figures for performance results:
+par(mfrow=c(2,2))
+hist(cv.sens,main=paste("sens",paste(round(quantile(cv.sens,probs=c(0.025,0.5,0.975)),digits=4),collapse=" ")))
+hist(cv.spec,main=paste("spec",paste(round(quantile(cv.spec,probs=c(0.025,0.5,0.975)),digits=4),collapse=" ")))
+hist(cv.ppv, main=paste("ppv", paste(round(quantile(cv.ppv,probs=c(0.025,0.5,0.975)), digits=4),collapse=" ")))
+hist(cv.npv, main=paste("npv", paste(round(quantile(cv.npv,probs=c(0.025,0.5,0.975)), digits=4),collapse=" ")))
+par(mfrow=c(1,1))
+
+# mean confusion matrix:
+tab <- cbind(c(mean(TP),mean(FP)),c(mean(FN),mean(TN)))
+rownames(tab) <- c("1","0")
+colnames(tab) <- c("pred 1","pred 0")
+print(tab)
+
+
+results.RF$TP <- TP
+results.RF$TN <- TN
+results.RF$FP <- FP
+results.RF$FN <- FN
+results.RF$cv.sens <- cv.sens
+results.RF$cv.spec <- cv.spec
+results.RF$cv.ppv <- cv.ppv
+results.RF$cv.npv <- cv.npv
+results.RF$cv.auc <- cv.auc
+```
+
+## step 3: establishing significance of original performance (nested CV)
+
+```{r,cache=TRUE}
+### permuted labels performance (CV)
+print(paste("permutation tests..."))
+set.seed(1)
+ncv <- 10 # set ncv=100 at least for realistic analysis!
+cv.sens.perm <- cv.spec.perm <- cv.ppv.perm <- cv.npv.perm <- cv.auc.perm <- c()
+TP.perm <- TN.perm <- FP.perm <- FN.perm <- c()
+
+for(cv in 1:ncv){   # outer CV loop 
+  CC.perm <- sample(CC)
+  
+  cat(".",append=TRUE)
+  if(cv%%10==0) print(cv)
+  
+  cv.index <- createDataPartition(y=as.factor(CC.perm),p=0.1,list=FALSE) # stratified partitions!
+  x.train <- proteins[-cv.index,]
+  y.train <- CC.perm[-cv.index]
+  x.test  <- proteins[cv.index,]
+  y.test  <- ifelse(CC.perm[cv.index]==1,"B","A")
+  
+  CCfact  <- as.factor(ifelse(y.train==1,"B","A"))
+  my.data <- data.frame(CCfact, x.train) 
+  RF.fit <- train(CCfact  ~ ., data = my.data,
+                  method = "ranger",
+                  trControl = trainControl(method="cv", number = 5, verboseIter = FALSE, classProbs = TRUE),
+                  tuneGrid = tgrid,
+                  num.trees = 100,
+                  importance = "permutation")
+
+  pred.prob <- (predict(RF.fit, x.test, type="prob"))$B  # probability of case ("B" or 1 or group=0, in our example)
+  pred <- predict(RF.fit, x.test)
+  
+  
+  test.res <- cbind(c(sum(y.test=="B" & pred=="B"),sum(y.test=="A" & pred=="B")),
+                    c(sum(y.test=="B" & pred=="A"),sum(y.test=="A" & pred=="A")))
+  
+  TP.perm[cv]=test.res[1,1]; TN.perm[cv]=test.res[2,2]; FP.perm[cv]=test.res[2,1]; FN.perm[cv]=test.res[1,2]
+  
+  cv.sens.perm[cv] <- TP.perm[cv]/(TP.perm[cv]+FN.perm[cv])
+  cv.spec.perm[cv] <- TN.perm[cv]/(TN.perm[cv]+FP.perm[cv])
+  cv.ppv.perm[cv]  <- TP.perm[cv]/(TP.perm[cv]+FP.perm[cv])
+  cv.npv.perm[cv]  <- TN.perm[cv]/(TN.perm[cv]+FN.perm[cv])
+  cv.auc.perm[cv]  <- as.numeric(pROC::auc(response=y.test, predictor=pred.prob,quiet=TRUE))
+}
+
+# figures for performance results:
+par(mfrow=c(2,2))
+hist(cv.sens.perm,main=paste("perm sens",paste(round(quantile(cv.sens.perm,probs=c(0.025,0.5,0.975),na.rm=TRUE),digits=2),collapse=" ")))
+hist(cv.spec.perm,main=paste("perm spec",paste(round(quantile(cv.spec.perm,probs=c(0.025,0.5,0.975),na.rm=TRUE),digits=2),collapse=" ")))
+hist(cv.ppv.perm,main=paste("perm ppv",paste(round(quantile(cv.ppv.perm,probs=c(0.025,0.5,0.975),na.rm=TRUE),digits=2),collapse=" ")))
+hist(cv.npv.perm,main=paste("perm npv",paste(round(quantile(cv.npv.perm,probs=c(0.025,0.5,0.975),na.rm=TRUE),digits=2),collapse=" ")))
+par(mfrow=c(1,1))
+```
+
+```{r}
+# mean confusion matrix (permutation test):
+tab <- cbind(c(mean(TP.perm),mean(FP.perm)),c(mean(FN.perm),mean(TN.perm)))
+rownames(tab) <- c("0","1")
+colnames(tab) <- c("pred 1","pred 0")
+print(tab)
+
+results.RF$TP.perm <- TP.perm
+results.RF$TN.perm <- TN.perm
+results.RF$FP.perm <- FP.perm
+results.RF$FN.perm <- FN.perm
+results.RF$cv.sens.perm <- cv.sens.perm
+results.RF$cv.spec.perm <- cv.spec.perm
+results.RF$cv.ppv.perm <- cv.ppv.perm
+results.RF$cv.npv.perm <- cv.npv.perm
+results.RF$cv.auc.perm <- cv.auc.perm
+  
+results.RF$p.val.perm.sens <- sum(cv.sens.perm >= mean(cv.sens),na.rm=TRUE) / length(cv.sens)
+results.RF$p.val.perm.sens
+
+results.RF$p.val.perm.spec <- sum(cv.spec.perm >= mean(cv.spec),na.rm=TRUE) / length(cv.spec)
+results.RF$p.val.perm.spec
+
+results.RF$p.val.perm.ppv  <- sum(cv.ppv.perm  >= mean(cv.ppv),na.rm=TRUE) / length(cv.ppv)
+results.RF$p.val.perm.ppv
+
+results.RF$p.val.perm.npv  <- sum(cv.npv.perm  >= mean(cv.npv),na.rm=TRUE) / length(cv.npv)
+results.RF$p.val.perm.npv
+
+results.RF$p.val.perm.auc  <- sum(cv.auc.perm  >= mean(cv.auc),na.rm=TRUE) / length(cv.auc)
+results.RF$p.val.perm.auc
+
+saveRDS(object=results.RF,file="allresults_predictions_RF.RDS")
+save.image("allResults02_20230929_lasso_RF.Rdata")
+```
+
+
+
+
+# sPLS
+
+## step 0: preparations for ML analysis:
+
+```{r, cache=TRUE}
+results.sPLS <- list()
+
+proteins.X.scaled <- scale(proteins.X, center = TRUE, scale = TRUE)
+
+# Here, choose if to use scaled or un-scaled proteins:
+#proteins.X.to.be.used <- proteins.X
+proteins.X.to.be.used <- proteins.X.scaled
+
+results.sPLS$name <- "pred-0-vs-3"
+
+## prepare dataset and outcome
+proteins.0.3 <- proteins.X.to.be.used[clinical.data$group %in% c(0,3), ]
+CC.0.3       <- clinical.data$group[clinical.data$group %in% c(0,3)]
+CC           <- ifelse(CC.0.3 == 3, 0, 1)  # as "3" is the actual reference, we code it as "0"
+proteins     <- proteins.0.3
+```
+
+## step 1: model fit and variable selection
+
+We use function "spls" as implementation of the sparse PLS approach as it implements LASSO-type sparsity (not just univariate filtering).
+
+```{r, cache=TRUE}
+library(spls)
+
+print(paste("fitting sPLS model", 0, "vs reference..."))
+
+tgrid <- expand.grid(
+  K     = seq(from = 2, to = 10, by = 2),
+  eta   = seq(from = 0.1, to = 0.9, by = 0.2),
+  kappa = 0.5
+)
+
+CCfact  <- factor(ifelse(CC == 1, "B", "A"), levels = c("A","B"))
+my.data <- data.frame(CCfact, proteins)
+
+sPLS.fit <- train(
+  CCfact ~ .,
+  data      = my.data,
+  method    = "spls",
+  trControl = trainControl(
+    method        = "cv",
+    number        = 5,
+    verboseIter   = FALSE,
+    classProbs    = TRUE,          # allow prob predictions
+    summaryFunction = twoClassSummary
+  ),
+  tuneGrid  = tgrid,
+  metric    = "ROC"                # select tuning by AUC
+)
+
+# apparent predictions on full data
+sPLS.pred <- predict(sPLS.fit, newdata = my.data)
+
+## confusion matrix (apparent)
+table(CCfact, sPLS.pred)
+
+print(paste("variable selection..."))
+
+# variable importance for class A (as in your original code)
+sPLS.imp <- (varImp(sPLS.fit))$importance$A
+
+barplot(sPLS.imp,
+        main = "sPLS variable importance",
+        ylab = "importance")
+
+# select top 30
+cut_imp <- sort(sPLS.imp, decreasing = TRUE)[31]
+abline(h = cut_imp, col = "red")
+sPLS.selected.proteins <- which(sPLS.imp > cut_imp)
+print(colnames(proteins)[sPLS.selected.proteins])
+
+results.sPLS$index.selected.proteins <- sPLS.selected.proteins
+results.sPLS$names.selected.proteins <- colnames(proteins)[sPLS.selected.proteins]
+results.sPLS$importances             <- sPLS.imp
+
+
+```
+
+
+## step 2: evaluating performance (nested CV)
+
+```{r, cache=TRUE}
+print("evaluating performance for sPLS ...")
+
+set.seed(1)
+ncv <- 10 
+cutoff <- 0.5
+
+cv.sens <- cv.spec <- cv.ppv <- cv.npv <- cv.auc <- numeric(ncv)
+TP <- TN <- FP <- FN <- numeric(ncv)
+
+for (cv in 1:ncv) {  # outer CV loop
+  print(cv)
+  
+  # 10% test sets, stratified regarding groups
+  cv.index <- createDataPartition(y = as.factor(CC), p = 0.1, list = FALSE)
+  
+  x.train <- proteins[-cv.index, ]
+  y.train <- CC[-cv.index]
+  x.test  <- proteins[cv.index, ]
+  y.test  <- ifelse(CC[cv.index] == 1, "B", "A")   # A/B labels for test
+  
+  CCfact.train <- factor(ifelse(y.train == 1, "B", "A"), levels = c("A","B"))
+  my.data.train <- data.frame(CCfact = CCfact.train, x.train)
+  
+  # reuse same tuning grid as above
+  sPLS.fit.cv <- train(
+    CCfact ~ .,
+    data      = my.data.train,
+    method    = "spls",
+    trControl = trainControl(
+      method        = "cv",
+      number        = 5,
+      verboseIter   = FALSE,
+      classProbs    = TRUE,
+      summaryFunction = twoClassSummary
+    ),
+    tuneGrid  = tgrid,
+    metric    = "ROC"
+  )
+  
+  x.test.df <- data.frame(x.test)
+  colnames(x.test.df) <- colnames(proteins)
+  
+  pred.prob <- predict(sPLS.fit.cv, newdata = x.test.df, type = "prob")[, "B"]
+  pred      <- predict(sPLS.fit.cv, newdata = x.test.df)
+  
+  # confusion matrix for this CV split
+  test.res <- cbind(
+    c(sum(y.test == "B" & pred == "B"), sum(y.test == "A" & pred == "B")),
+    c(sum(y.test == "B" & pred == "A"), sum(y.test == "A" & pred == "A"))
+  )
+  
+  TP[cv] <- test.res[1,1]; TN[cv] <- test.res[2,2]
+  FP[cv] <- test.res[2,1]; FN[cv] <- test.res[1,2]
+  
+  cv.sens[cv] <- TP[cv] / (TP[cv] + FN[cv])
+  cv.spec[cv] <- TN[cv] / (TN[cv] + FP[cv])
+  cv.ppv[cv]  <- TP[cv] / (TP[cv] + FP[cv])
+  cv.npv[cv]  <- TN[cv] / (TN[cv] + FN[cv])
+  cv.auc[cv]  <- as.numeric(pROC::auc(response = y.test, predictor = pred.prob, quiet = TRUE))
+} # end of outer CV loop
+
+
+# figures for performance results:
+par(mfrow = c(2,2))
+hist(cv.sens, main = paste("sens", paste(round(quantile(cv.sens, probs = c(0.025,0.5,0.975)), digits = 4), collapse = " ")))
+hist(cv.spec, main = paste("spec", paste(round(quantile(cv.spec, probs = c(0.025,0.5,0.975)), digits = 4), collapse = " ")))
+hist(cv.ppv,  main = paste("ppv",  paste(round(quantile(cv.ppv,  probs = c(0.025,0.5,0.975)), digits = 4), collapse = " ")))
+hist(cv.npv,  main = paste("npv",  paste(round(quantile(cv.npv,  probs = c(0.025,0.5,0.975)), digits = 4), collapse = " ")))
+par(mfrow = c(1,1))
+
+# mean confusion matrix:
+tab <- cbind(c(mean(TP), mean(FP)), c(mean(FN), mean(TN)))
+rownames(tab) <- c("1","0")
+colnames(tab) <- c("pred 1","pred 0")
+print(tab)
+
+results.sPLS$TP      <- TP
+results.sPLS$TN      <- TN
+results.sPLS$FP      <- FP
+results.sPLS$FN      <- FN
+results.sPLS$cv.sens <- cv.sens
+results.sPLS$cv.spec <- cv.spec
+results.sPLS$cv.ppv  <- cv.ppv
+results.sPLS$cv.npv  <- cv.npv
+results.sPLS$cv.auc  <- cv.auc
+
+
+```
+
+## step 3: establishing significance of original performance (nested CV)
+
+```{r, cache=TRUE}
+print("permutation tests for sPLS...")
+
+set.seed(1)
+ncv <- 10 # set ncv=100 at least for realistic analysis
+
+cv.sens.perm <- cv.spec.perm <- cv.ppv.perm <- cv.npv.perm <- cv.auc.perm <- numeric(ncv)
+TP.perm <- TN.perm <- FP.perm <- FN.perm <- numeric(ncv)
+
+for (cv in 1:ncv) {
+  CC.perm <- sample(CC)  # permute labels
+  if (cv %% 10 == 0) print(cv)
+  
+  cv.index <- createDataPartition(y = as.factor(CC.perm), p = 0.1, list = FALSE)
+  
+  x.train <- proteins[-cv.index, ]
+  y.train <- CC.perm[-cv.index]
+  x.test  <- proteins[cv.index, ]
+  y.test  <- ifelse(CC.perm[cv.index] == 1, "B", "A")
+  
+  CCfact.train <- factor(ifelse(y.train == 1, "B", "A"), levels = c("A","B"))
+  my.data.train <- data.frame(CCfact = CCfact.train, x.train)
+  
+  sPLS.fit.perm <- train(
+    CCfact ~ .,
+    data      = my.data.train,
+    method    = "spls",
+    trControl = trainControl(
+      method        = "cv",
+      number        = 5,
+      verboseIter   = FALSE,
+      classProbs    = TRUE,
+      summaryFunction = twoClassSummary
+    ),
+    tuneGrid  = tgrid,
+    metric    = "ROC"
+  )
+  
+  x.test.df <- data.frame(x.test)
+  colnames(x.test.df) <- colnames(proteins)
+  
+  pred.prob <- predict(sPLS.fit.perm, newdata = x.test.df, type = "prob")[, "B"]
+  pred      <- predict(sPLS.fit.perm, newdata = x.test.df)
+  
+  test.res <- cbind(
+    c(sum(y.test == "B" & pred == "B"), sum(y.test == "A" & pred == "B")),
+    c(sum(y.test == "B" & pred == "A"), sum(y.test == "A" & pred == "A"))
+  )
+  
+  TP.perm[cv] <- test.res[1,1]; TN.perm[cv] <- test.res[2,2]
+  FP.perm[cv] <- test.res[2,1]; FN.perm[cv] <- test.res[1,2]
+  
+  cv.sens.perm[cv] <- TP.perm[cv] / (TP.perm[cv] + FN.perm[cv])
+  cv.spec.perm[cv] <- TN.perm[cv] / (TN.perm[cv] + FP.perm[cv])
+  cv.ppv.perm[cv]  <- TP.perm[cv] / (TP.perm[cv] + FP.perm[cv])
+  cv.npv.perm[cv]  <- TN.perm[cv] / (TN.perm[cv] + FN.perm[cv])
+  cv.auc.perm[cv]  <- as.numeric(pROC::auc(response = y.test, predictor = pred.prob, quiet = TRUE))
+}
+
+par(mfrow = c(2,2))
+hist(cv.sens.perm, main = paste("perm sens", paste(round(quantile(cv.sens.perm, probs = c(0.025,0.5,0.975), na.rm=TRUE), digits=2), collapse=" ")))
+hist(cv.spec.perm, main = paste("perm spec", paste(round(quantile(cv.spec.perm, probs = c(0.025,0.5,0.975), na.rm=TRUE), digits=2), collapse=" ")))
+hist(cv.ppv.perm,  main = paste("perm ppv",  paste(round(quantile(cv.ppv.perm,  probs = c(0.025,0.5,0.975), na.rm=TRUE), digits=2), collapse=" ")))
+hist(cv.npv.perm,  main = paste("perm npv",  paste(round(quantile(cv.npv.perm,  probs = c(0.025,0.5,0.975), na.rm=TRUE), digits=2), collapse=" ")))
+par(mfrow = c(1,1))
+
+tab.perm <- cbind(c(mean(TP.perm), mean(FP.perm)),
+c(mean(FN.perm), mean(TN.perm)))
+rownames(tab.perm) <- c("0","1")
+colnames(tab.perm) <- c("pred 1","pred 0")
+print(tab.perm)
+
+results.sPLS$TP.perm <- TP.perm
+results.sPLS$TN.perm <- TN.perm
+results.sPLS$FP.perm <- FP.perm
+results.sPLS$FN.perm <- FN.perm
+results.sPLS$cv.sens.perm <- cv.sens.perm
+results.sPLS$cv.spec.perm <- cv.spec.perm
+results.sPLS$cv.ppv.perm <- cv.ppv.perm
+results.sPLS$cv.npv.perm <- cv.npv.perm
+results.sPLS$cv.auc.perm <- cv.auc.perm
+
+results.sPLS$p.val.perm.sens <- sum(cv.sens.perm >= mean(cv.sens), na.rm=TRUE) / length(cv.sens)
+results.sPLS$p.val.perm.spec <- sum(cv.spec.perm >= mean(cv.spec), na.rm=TRUE) / length(cv.spec)
+results.sPLS$p.val.perm.ppv <- sum(cv.ppv.perm >= mean(cv.ppv), na.rm=TRUE) / length(cv.ppv)
+results.sPLS$p.val.perm.npv <- sum(cv.npv.perm >= mean(cv.npv), na.rm=TRUE) / length(cv.npv)
+results.sPLS$p.val.perm.auc <- sum(cv.auc.perm >= mean(cv.auc), na.rm=TRUE) / length(cv.auc)
+```
+
+
+```{r}
+all.results <- list(LASSO = results.LASSO, RF = results.RF, sPLS = results.sPLS)
+saveRDS(all.results, file = "allresults_predictions_lasso_RF_sPLS.RDS")
+save.image("allResults02_20230929_lasso_RF_sPLS.Rdata")
+```
+
+
