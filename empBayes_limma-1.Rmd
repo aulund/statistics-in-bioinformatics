@@ -1,0 +1,118 @@
+---
+title: "MEDBIOINFO: Statistics for Bioinformatics -- empirical Bayes and limma"
+author: "Dirk.Repsilber@oru.se"
+date: '2025-11-27'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data simulation: molecular data roughly normally distributed (log-level)
+
+```{r data simulation}
+set.seed(12345)
+
+n.features <- 10000
+n.samples.per.group <- 6
+
+# simulate expr data for two identical groups, n.samples.per.group each:
+
+X <- matrix(NA, nrow=n.features, ncol=2*n.samples.per.group)
+
+for(i in 1:n.features){
+  
+  genes.sd <- abs(rnorm(n=1, mean=1, sd=0.1))
+  
+  genes.expression.values <- rnorm(n=2*n.samples.per.group,mean=0,sd=genes.sd)
+  
+  X[i,] <- genes.expression.values
+  
+}
+
+n.diff <- 20
+
+# spike-in differentially expressed features 1:ndiff:
+
+for(i in 1:n.diff){
+  
+  genes.delta <- rnorm(1,mean=2, sd=1)
+  
+  X[i,(n.samples.per.group + 1):(2*n.samples.per.group)] <- X[i,(n.samples.per.group + 1):(2*n.samples.per.group)] + genes.delta + rnorm(n=n.samples.per.group,mean=0,sd=0.2)
+  
+}
+
+
+```
+
+
+# Analyse data with t-test
+
+```{r differential expression analysis with t-test}
+p <- delta <- c()
+
+for(i in 1:n.features){
+  res.t.test <- t.test(X[i,1:n.samples.per.group],X[i,(n.samples.per.group + 1):(2*n.samples.per.group)])
+  p[i] <- res.t.test$p.value
+  delta[i] <- res.t.test$estimate[2] - res.t.test$estimate[1]
+}
+
+```
+
+Volcano for all features, spiked-in features marked:
+
+```{r volcano plot}
+
+my.colours <- rep("black",n.features)
+my.colours[1:n.diff] <- "red"
+
+plot(delta, -log10(p), pch=19, cex=0.5, col=my.colours)
+points(delta[1:n.diff], -log10(p[1:n.diff]), pch=19, cex=1, col="red")
+
+
+```
+
+
+
+# Analysis shrinked to global sd
+
+```{r analysis with shrinked sd}
+
+global.sd <- mean(apply(X,1,sd))
+shrinkage <- 0.5
+
+T.shrinked <- p.shrinked <- c()
+
+for(i in 1:n.features){
+  
+  T.shrinked[i] <- delta[i] / (shrinkage*global.sd**2 + (1-shrinkage)*sd(X[i,]))/sqrt(n.samples.per.group)
+  
+  p.shrinked[i] <- 1 - pt(q=abs(T.shrinked[i]), df=2*n.samples.per.group - 2)
+  
+}
+
+
+plot(delta, -log10(p.shrinked), pch=19, cex=0.5, col=my.colours)
+points(delta[1:n.diff], -log10(p.shrinked[1:n.diff]), pch=19, cex=1, col="red")
+
+```
+
+
+
+# Analysis using limma
+
+```{r}
+library(limma)
+my.design <- cbind(grp1=c(rep(1,n.samples.per.group),rep(0,n.samples.per.group)),grp2=c(rep(0,n.samples.per.group),rep(1,n.samples.per.group)))
+fit <- lmFit(object=X, design=my.design)
+my.contrasts <- makeContrasts(grp2-grp1, levels=my.design)
+fit2 <- contrasts.fit(fit, my.contrasts)
+fit2 <- eBayes(fit2)
+
+plot(delta,-log10(fit2$p.value),pch=19,cex=0.1)
+points(delta[1:n.diff],-log10(fit2$p.value[1:n.diff]),pch=19, col="red", cex=1) 
+
+```
+
+

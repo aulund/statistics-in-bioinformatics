@@ -1,0 +1,109 @@
+---
+title: "MEDBIOINFO: Statistics for Bioinformatics -- CCA examples"
+author: "Dirk.Repsilber@oru.se"
+date: '2025-11-27'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(PMA)
+```
+
+# Data from APRO study, log-transformed and imputed
+
+Data are from the APRO study, to be published, from the NGBI Research Environment at the School of Medical Sciences, Örebro University:
+
+https://www.oru.se/english/research/research-environments/mh/nutrition-gut-brain-interactions-research-centre-ngbi/Research_Teams/
+
+X: questionnaire data ("symptoms")
+
+Z: blood markers for inflammation, gut permeability, tissue damage, oxidative stress, SCFAs
+
+
+```{r}
+X <- readRDS("APRO_X.RDS")
+Z <- readRDS("APRO_Z.RDS")
+```
+
+
+# sCCA with X markers, Z outcome
+
+```{r}
+## number of latent variable pairs to extract:
+my.K <- 10 
+standardize <- FALSE
+
+CCA.res <- CCA(x=X ,z=Z, standardize=standardize, K=my.K)
+
+## canonical correlations found:
+CCA.res$cors 
+
+## reproduce 5th pair of latent variables and its correlation:
+cor(X %*% CCA.res$u[,5], Z %*% CCA.res$v[,5])
+```
+
+# Permutation p-values
+
+Function to implement permutation test for canonical correlations:
+
+```{r}
+get.perm.p.CCA <- function(my.x,my.z,K,N,standardize,seed){
+  require(PMA)
+  CCA.res.orig <- CCA(x=my.x,z=my.z,standardize=standardize,K=K,trace=FALSE)
+  CCA.cor.orig <- CCA.res.orig$cors
+  CCA.perm.cors <- matrix(NA,nrow=N,ncol=K)
+  set.seed(seed)
+  for(p in 1:N){
+    my.x.perm <- my.x[sample(1:nrow(my.x)),]
+    my.z.perm <- my.z[sample(1:nrow(my.z)),]
+    CCA.perm.cors[p,] <- (CCA(x=my.x.perm,z=my.z.perm,standardize=standardize,K=K,trace=FALSE))$cors
+  }
+  p.values <- c()
+  for(k in 1:K){
+    p.values[k] <- sum(CCA.perm.cors[,k] >= CCA.cor.orig[k])/N
+  }
+  return(list(CCA.cor=CCA.cor.orig,p=p.values))
+}
+```
+
+```{r}
+res.perm   <- get.perm.p.CCA(my.x=X,my.z=Z,K=my.K,N=500,standardize=standardize,seed=123)
+
+res.perm
+```
+
+
+# Scatterplot of latent variables
+
+```{r}
+no.CCA <- 5
+
+plot(X %*% CCA.res$u[,no.CCA], Z %*% CCA.res$v[,no.CCA], main=paste("CCA cor=",round(CCA.res$cors[no.CCA],digits=3)))
+abline(lm(Z %*% CCA.res$v[,no.CCA] ~ X %*% CCA.res$u[,no.CCA]))
+
+```
+
+# Extracting important variables
+
+```{r}
+for(i in 1:my.K){
+  print("-----------------")
+  print(paste("latent pair: ",i))
+  print(paste("u variables:"))
+  print(colnames(X)[which(CCA.res$u[,i] != 0)])
+  print(paste("v variables:"))
+  print(colnames(Z)[which(CCA.res$v[,i] != 0)])
+  print("-----------------")
+}
+
+```
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,199 @@
+---
+title: "MEDBIOINFO: Statistics for Bioinformatics -- precision medicine: random effects"
+author: "Dirk.Repsilber@oru.se"
+date: '2024-11-26'
+output: html_document
+---
+
+
+# mixed effects model example - a minimal digital twin
+
+```{r}
+library(lme4)
+```
+
+## general model: based on fixed effects
+
+```{r}
+lm.res <- lm(Reaction ~ Days, data=sleepstudy)
+plot(sleepstudy$Days, sleepstudy$Reaction, pch=19, col="black",xlab="time",ylab="outcome")
+abline(lm.res,col="black",lwd=5)
+```
+
+## individual models: fixed + random effects
+
+```{r}
+
+lme.res <- lmer(Reaction ~ Days + (Days|Subject), data=sleepstudy)
+summary(lme.res)
+
+my.cols <- rainbow(18)[as.numeric(sleepstudy$Subject)]
+plot(sleepstudy$Days, sleepstudy$Reaction, pch=19, col=my.cols,xlab="time",ylab="outcome")
+abline(lm.res,col="black",lwd=5)
+
+
+my.cols <- rainbow(18)[as.numeric(sleepstudy$Subject)]
+plot(sleepstudy$Days, sleepstudy$Reaction, pch=19, col=my.cols,xlab="time",ylab="outcome")
+abline(lm.res,col="black",lwd=5)
+indiv.coef <- coef(lme.res)$Subject
+for(i in 1:nrow(indiv.coef)){
+  abline(a=indiv.coef[i,1],b=indiv.coef[i,2],col=unique(my.cols)[i])
+}
+```
+
+
+## a new individual
+
+```{r}
+sleepstudy2 <- sleepstudy[c(1:10,11,21:180),]
+lme.res2 <- lmer(Reaction ~ Days + (Days|Subject), data=sleepstudy2)
+plot(sleepstudy2$Days, sleepstudy2$Reaction, pch=19, col="black",xlab="time",ylab="outcome")
+abline(lm.res,col="black",lwd=5)
+points(sleepstudy2$Days[sleepstudy2$Subject==309], sleepstudy2$Reaction[sleepstudy2$Subject==309], pch=19, col="red",cex=3)
+indiv.coef2 <- coef(lme.res2)$Subject
+for(i in which(rownames(indiv.coef2)==309)){
+  abline(a=indiv.coef2[i,1],b=indiv.coef2[i,2],col="red",lwd=4)
+}
+```
+
+```{r}
+sleepstudy2 <- sleepstudy[c(1:10,11:13,21:180),]
+lme.res2 <- lmer(Reaction ~ Days + (Days|Subject), data=sleepstudy2)
+plot(sleepstudy2$Days, sleepstudy2$Reaction, pch=19, col="black",xlab="time",ylab="outcome")
+abline(lm.res,col="black",lwd=5)
+points(sleepstudy2$Days[sleepstudy2$Subject==309], sleepstudy2$Reaction[sleepstudy2$Subject==309], pch=19, col="red",cex=3)
+indiv.coef2 <- coef(lme.res2)$Subject
+for(i in which(rownames(indiv.coef2)==309)){
+  abline(a=indiv.coef2[i,1],b=indiv.coef2[i,2],col="red",lwd=4)
+}
+```
+
+```{r}
+sleepstudy2 <- sleepstudy[c(1:10,11:15,21:180),]
+lme.res2 <- lmer(Reaction ~ Days + (Days|Subject), data=sleepstudy2)
+plot(sleepstudy2$Days, sleepstudy2$Reaction, pch=19, col="black",xlab="time",ylab="outcome")
+abline(lm.res,col="black",lwd=5)
+points(sleepstudy2$Days[sleepstudy2$Subject==309], sleepstudy2$Reaction[sleepstudy2$Subject==309], pch=19, col="red",cex=3)
+indiv.coef2 <- coef(lme.res2)$Subject
+for(i in which(rownames(indiv.coef2)==309)){
+  abline(a=indiv.coef2[i,1],b=indiv.coef2[i,2],col="red",lwd=4)
+}
+```
+
+```{r}
+sleepstudy2 <- sleepstudy[c(1:10,19,21:180),]
+lme.res2 <- lmer(Reaction ~ Days + (Days|Subject), data=sleepstudy2)
+plot(sleepstudy2$Days, sleepstudy2$Reaction, pch=19, col="black",xlab="time",ylab="outcome")
+abline(lm.res,col="black",lwd=5)
+points(sleepstudy2$Days[sleepstudy2$Subject==309], sleepstudy2$Reaction[sleepstudy2$Subject==309], pch=19, col="red",cex=3)
+indiv.coef2 <- coef(lme.res2)$Subject
+for(i in which(rownames(indiv.coef2)==309)){
+  abline(a=indiv.coef2[i,1],b=indiv.coef2[i,2],col="red",lwd=4)
+}
+```
+
+
+# dependency of shrinkage to the average on design and data
+
+```{r}
+
+# Load package
+library(lme4)
+
+set.seed(123)
+
+# Helper function: simulate and fit one scenario
+simulate_and_fit <- function(n_students, n_obs) {
+  true_pop_slope <- 5
+  true_pop_intercept <- 50
+  sd_intercept <- 5
+  sd_slope <- 2
+  sd_error <- 5
+
+  # Random intercepts and slopes
+  rand_intercepts <- rnorm(n_students, mean = 0, sd = sd_intercept)
+  rand_slopes <- rnorm(n_students, mean = 0, sd = sd_slope)
+
+  # Build dataset
+  student <- rep(1:n_students, each = n_obs)
+  sleep <- rep(seq(4, 10, length.out = n_obs), times = n_students)
+
+  intercept <- true_pop_intercept + rand_intercepts[student]
+  slope <- true_pop_slope + rand_slopes[student]
+
+  score <- intercept + slope * sleep + rnorm(n_students * n_obs, 0, sd_error)
+
+  data <- data.frame(student = factor(student), sleep = sleep, score = score)
+
+  # Fit mixed model
+  model <- lmer(score ~ sleep + (sleep | student), data = data, REML = TRUE)
+
+  # Extract slopes
+  true_slopes <- true_pop_slope + rand_slopes
+  est_slopes <- coef(model)$student[, "sleep"]
+
+  list(true_slopes = true_slopes, est_slopes = est_slopes, pop_slope = true_pop_slope)
+}
+
+# Function to compare 4 scenarios in a 2x2 grid
+compare_shrinkage <- function(n_students_few, n_students_many, n_obs_few, n_obs_many) {
+  # Run all four scenarios
+  res1 <- simulate_and_fit(n_students_few, n_obs_few) # few students, few obs
+  res2 <- simulate_and_fit(n_students_few, n_obs_many) # few students, many obs
+  res3 <- simulate_and_fit(n_students_many, n_obs_few) # many students, few obs
+  res4 <- simulate_and_fit(n_students_many, n_obs_many) # many students, many obs
+
+  par(mfrow = c(2, 2))
+
+  plot(res1$true_slopes, pch = 19, col = "blue",
+       ylim = range(c(res1$true_slopes, res1$est_slopes)),
+       xlab = "Student", ylab = "Slope",
+       main = paste("Few students,", n_obs_few, "obs"))
+  points(res1$est_slopes, pch = 17, col = "red")
+  abline(h = res1$pop_slope, lty = 2)
+
+  plot(res2$true_slopes, pch = 19, col = "blue",
+       ylim = range(c(res2$true_slopes, res2$est_slopes)),
+       xlab = "Student", ylab = "Slope",
+       main = paste("Few students,", n_obs_many, "obs"))
+  points(res2$est_slopes, pch = 17, col = "red")
+  abline(h = res2$pop_slope, lty = 2)
+
+  plot(res3$true_slopes, pch = 19, col = "blue",
+       ylim = range(c(res3$true_slopes, res3$est_slopes)),
+       xlab = "Student", ylab = "Slope",
+       main = paste("Many students,", n_obs_few, "obs"))
+  points(res3$est_slopes, pch = 17, col = "red")
+  abline(h = res3$pop_slope, lty = 2)
+
+  plot(res4$true_slopes, pch = 19, col = "blue",
+       ylim = range(c(res4$true_slopes, res4$est_slopes)),
+       xlab = "Student", ylab = "Slope",
+       main = paste("Many students,", n_obs_many, "obs"))
+  points(res4$est_slopes, pch = 17, col = "red")
+  abline(h = res4$pop_slope, lty = 2)
+}
+
+# --- Example usage ---
+compare_shrinkage(n_students_few = 5, n_students_many = 30,n_obs_few = 5, n_obs_many = 20)
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,84 @@
+---
+  title: "MEDBIOINFO: Statistics for Bioinformatics -- mediation analysis example"
+author: "Dirk.Repsilber@oru.se"
+date: '2024-11-26'
+output: html_document
+---
+  
+# simulate outcomes "y" as dependent on "x" and mediated by "med"
+
+```{r}
+set.seed(12345)
+
+nsamples <- 15000
+
+x      <- rnorm(nsamples, mean=0, sd=0.5)
+med    <- 4 + .7 * x + rnorm(nsamples, sd = 1)
+
+# the continous outcome, with 100% proportion mediated:
+y100   <- 2.5 + 0   * x + 0.4 * med + rnorm(nsamples, sd = 0.5)
+
+# the binarised outcome:
+y100.b <- ifelse(y100>mean(y100),1,0)
+
+# the continous outcome, with 50% proportion mediated:
+y050   <- 2.5 + 0.4 * x + 0.4 * med + rnorm(nsamples, sd = 0.5)
+
+# the binarised outcome:
+y050.b <- ifelse(y050>mean(y050),1,0)
+
+# the continous outcome, with 25% proportion mediated:
+y025   <- 2.5 + 1.2 * x + 0.4 * med + rnorm(nsamples, sd = 0.5)
+
+# the binarised outcome:
+y025.b <- ifelse(y025>mean(y025),1,0)
+
+#binarised x:
+x.b <- ifelse(x>mean(x),1,0)
+```
+
+
+
+# Check the relationship between x and med
+
+```{r}
+mod.med <- lm(med ~ x.b)
+summary(mod.med)
+```
+
+
+# Check the relationships between x, med, and y, both for continous and binarised outcomes:
+
+```{r}
+mod.100 <- glm(y100.b ~ x.b + med, family=binomial(link = "logit"))
+summary(mod.100)
+
+mod.050 <- glm(y050.b ~ x.b + med, family=binomial(link = "logit"))
+summary(mod.050)
+
+mod.025 <- glm(y025.b ~ x.b + med, family=binomial(link = "logit"))
+summary(mod.025)
+
+
+# Check the relationship between x and y:
+mod <- glm(y100 ~ x)
+summary(mod)
+```
+
+
+# Mediation analysis on simulated data:
+
+```{r}
+library(mediation)
+
+results100 <- mediate(mod.med, mod.100, treat='x.b', mediator='med', boot=T)
+summary(results100)
+
+results050 <- mediate(mod.med, mod.050, treat='x.b', mediator='med', boot=T)
+summary(results050)
+
+results025 <- mediate(mod.med, mod.025, treat='x.b', mediator='med', boot=T)
+summary(results025)
+
+
+```
